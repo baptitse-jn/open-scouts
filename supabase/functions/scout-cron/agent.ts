@@ -19,6 +19,14 @@ import {
   trackDuplicateDetected,
 } from "./posthog.ts";
 
+// Convert OpenAI message format to Gemini format
+function convertToGeminiFormat(messages: Array<{role: string, content: string}>) {
+  return messages.map(msg => ({
+    role: msg.role === "assistant" ? "model" : "user",
+    parts: [{ text: msg.content }]
+  }));
+}
+
 // Calculate cosine similarity between two vectors
 function cosineSimilarity(vecA: number[], vecB: number[]): number {
   if (vecA.length !== vecB.length) {
@@ -79,10 +87,10 @@ export async function executeScoutAgent(scout: Scout, supabase: any): Promise<vo
   );
 
   try {
-    const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
+    const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
 
-    if (!OPENAI_API_KEY) {
-      throw new Error("OPENAI_API_KEY not configured");
+    if (!GEMINI_API_KEY) {
+      throw new Error("GEMINI_API_KEY not configured");
     }
 
     // Get the user's Firecrawl API key - no fallback, each user must have their own key
@@ -125,7 +133,7 @@ export async function executeScoutAgent(scout: Scout, supabase: any): Promise<vo
         // Filter out executions with invalid embeddings (null, undefined, or empty arrays)
         similarExecutions = recentExecutions.filter((exec) => {
           const embedding = exec.summary_embedding;
-          const isValid = Array.isArray(embedding) && embedding.length === 1536;
+          const isValid = Array.isArray(embedding) && embedding.length === 768;
           if (!isValid && embedding) {
             console.log(`⚠️ Filtering out execution from ${exec.completed_at} - invalid embedding length: ${Array.isArray(embedding) ? embedding.length : 'not an array'}`);
           }
@@ -273,8 +281,8 @@ REMINDER: Write your final response like a NEWS BRIEF. DO NOT mention your proce
     stepNumber++;
     await createStep(supabase, executionId, stepNumber, {
       step_type: "tool_call",
-      description: "Initializing agent with OpenAI",
-      input_data: { model: "gpt-5.1-2025-11-13", system: systemPrompt.substring(0, 200) + "..." },
+      description: "Initializing agent with Gemini",
+      input_data: { model: "gemini-2.5-pro-preview-06-05", system: systemPrompt.substring(0, 200) + "..." },
       status: "running",
     });
 
@@ -305,62 +313,81 @@ REMINDER: Write your final response like a NEWS BRIEF. DO NOT mention your proce
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 60000);
 
-      const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
+      // Prepare Gemini request
+      const systemInstruction = conversationMessages.find(m => m.role === "system");
+      const otherMessages = conversationMessages.filter(m => m.role !== "system");
+      const contents = convertToGeminiFormat(otherMessages);
+
+      const tools = [
+        {
+          name: "searchWeb",
+          description: "Search the web using Firecrawl. Returns results with snippets, published dates, and favicons.",
+          parameters: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "Search query" },
+              limit: { type: "number", description: "Number of results (1-10)" },
+              tbs: { type: "string", description: "Time filter: qdr:h (hour), qdr:d (day), qdr:w (week), qdr:m (month)" },
+            },
+            required: ["query"],
+          },
         },
-        body: JSON.stringify({
-          model: "gpt-5.1-2025-11-13",
-          messages: conversationMessages,
-          tools: [
-            {
-              type: "function",
-              function: {
-                name: "searchWeb",
-                description: "Search the web using Firecrawl. Returns results with snippets, published dates, and favicons.",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    query: { type: "string", description: "Search query" },
-                    limit: { type: "number", description: "Number of results (1-10)", default: 5 },
-                    tbs: { type: "string", description: "Time filter: qdr:h (hour), qdr:d (day), qdr:w (week), qdr:m (month)" },
-                  },
-                  required: ["query"],
-                },
-              },
+        {
+          name: "scrapeWebsite",
+          description: "Scrape a URL to get full page content and screenshots. ALWAYS use this to verify search results - scraping is essential for accurate information gathering. Returns markdown content and a screenshot URL.",
+          parameters: {
+            type: "object",
+            properties: {
+              url: { type: "string", description: "URL to scrape" },
             },
-            {
-              type: "function",
-              function: {
-                name: "scrapeWebsite",
-                description: "Scrape a URL to get full page content and screenshots. ALWAYS use this to verify search results - scraping is essential for accurate information gathering. Returns markdown content and a screenshot URL.",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    url: { type: "string", description: "URL to scrape" },
-                  },
-                  required: ["url"],
-                },
-              },
-            },
-          ],
-          tool_choice: "auto",
-        }),
-        signal: controller.signal,
-      });
+            required: ["url"],
+          },
+        },
+      ];
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-preview-06-05:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents,
+            systemInstruction: systemInstruction ? { parts: [{ text: systemInstruction.content }] } : undefined,
+            tools: [{
+              functionDeclarations: tools
+            }],
+            toolConfig: { functionCallingConfig: { mode: "AUTO" } },
+          }),
+          signal: controller.signal,
+        }
+      );
 
       clearTimeout(timeoutId);
 
       if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`OpenAI API error: ${errorText}`);
+        throw new Error(`Gemini API error: ${errorText}`);
       }
 
       const data = await response.json();
-      const choice = data.choices[0];
-      const assistantMessage = choice.message;
+      const candidate = data.candidates?.[0];
+      const content = candidate?.content;
+      const textPart = content?.parts?.find((p: any) => p.text);
+      const functionCalls = content?.parts?.filter((p: any) => p.functionCall) || [];
+
+      // Build assistant message in OpenAI-compatible format for conversation history
+      const assistantMessage: any = {
+        role: "assistant",
+        content: textPart?.text || null,
+        tool_calls: functionCalls.length > 0 ? functionCalls.map((fc: any, idx: number) => ({
+          id: `call_${Date.now()}_${idx}`,
+          type: "function",
+          function: {
+            name: fc.functionCall.name,
+            arguments: JSON.stringify(fc.functionCall.args || {}),
+          },
+        })) : undefined,
+      };
 
       conversationMessages.push(assistantMessage);
 
@@ -526,62 +553,57 @@ REMINDER: Write your final response like a NEWS BRIEF. DO NOT mention your proce
           try {
             console.log(`Generating one-sentence summary...`);
 
-            // Generate a concise one-sentence summary using OpenAI
+            // Generate a concise one-sentence summary using Gemini
             const summaryController = new AbortController();
             const summaryTimeoutId = setTimeout(() => summaryController.abort(), 60000);
 
-            const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${OPENAI_API_KEY}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                model: "gpt-5.1-2025-11-13",
-                messages: [
-                  {
-                    role: "system",
-                    content: "You are a concise summarizer. Generate a single sentence (max 150 characters) that captures the key finding from the scout execution. Focus on what was discovered, not the process. Be specific and include key details like names, locations, or dates if present."
-                  },
-                  {
+            const summaryResponse = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${GEMINI_API_KEY}`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  contents: [{
                     role: "user",
-                    content: `Scout goal: ${scout.goal}\n\nFindings: ${scoutResponse.response}\n\nGenerate a one-sentence summary (max 150 characters) of the key discovery.`
-                  }
-                ],
-              }),
-              signal: summaryController.signal,
-            });
+                    parts: [{ text: `Scout goal: ${scout.goal}\n\nFindings: ${scoutResponse.response}\n\nGenerate a one-sentence summary (max 150 characters) of the key discovery. Focus on what was discovered, not the process. Be specific and include key details like names, locations, or dates if present.` }]
+                  }],
+                  systemInstruction: {
+                    parts: [{ text: "You are a concise summarizer. Generate a single sentence (max 150 characters) that captures the key finding from the scout execution. Focus on what was discovered, not the process. Be specific and include key details like names, locations, or dates if present." }]
+                  },
+                }),
+                signal: summaryController.signal,
+              }
+            );
 
             clearTimeout(summaryTimeoutId);
 
             if (summaryResponse.ok) {
               const summaryData = await summaryResponse.json();
-              summaryText = summaryData.choices[0].message.content.trim();
+              summaryText = summaryData.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
               console.log(`Generated summary: ${summaryText}`);
 
-              // Generate embedding for the summary
+              // Generate embedding for the summary using Gemini
               console.log(`Generating embedding for summary...`);
               const embeddingController = new AbortController();
               const embeddingTimeoutId = setTimeout(() => embeddingController.abort(), 60000);
 
-              const embeddingResponse = await fetch("https://api.openai.com/v1/embeddings", {
-                method: "POST",
-                headers: {
-                  "Authorization": `Bearer ${OPENAI_API_KEY}`,
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  model: "text-embedding-3-small",
-                  input: summaryText,
-                }),
-                signal: embeddingController.signal,
-              });
+              const embeddingResponse = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${GEMINI_API_KEY}`,
+                {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    content: { parts: [{ text: summaryText }] }
+                  }),
+                  signal: embeddingController.signal,
+                }
+              );
 
               clearTimeout(embeddingTimeoutId);
 
               if (embeddingResponse.ok) {
                 const embeddingData = await embeddingResponse.json();
-                summaryEmbedding = embeddingData.data[0].embedding;
+                summaryEmbedding = embeddingData.embedding?.values; // 768 dimensions
                 console.log(`Embedding generated successfully (${summaryEmbedding?.length || 0} dimensions)`);
               } else {
                 console.error("Failed to generate embedding:", await embeddingResponse.text());
@@ -612,7 +634,7 @@ REMINDER: Write your final response like a NEWS BRIEF. DO NOT mention your proce
                 const prevEmbedding = prevExecution.summary_embedding as number[];
 
                 // Additional validation - should already be filtered but double-check
-                if (!Array.isArray(prevEmbedding) || prevEmbedding.length !== 1536) {
+                if (!Array.isArray(prevEmbedding) || prevEmbedding.length !== 768) {
                   console.log(`  ⚠️  Skipping comparison - invalid previous embedding (length: ${Array.isArray(prevEmbedding) ? prevEmbedding.length : 'not an array'}) for execution from ${prevExecution.completed_at}`);
                   continue;
                 }

@@ -262,7 +262,7 @@ async function runMigrations() {
 async function syncEdgeFunctionSecrets() {
   // Define which secrets to sync (env var name -> secret name)
   const secretsToSync = [
-    { env: 'OPENAI_API_KEY', name: 'OPENAI_API_KEY', required: true },
+    { env: 'GEMINI_API_KEY', name: 'GEMINI_API_KEY', required: true },
     { env: 'FIRECRAWL_API_KEY', name: 'FIRECRAWL_API_KEY', required: true },
     { env: 'RESEND_API_KEY', name: 'RESEND_API_KEY', required: false },
     { env: 'RESEND_FROM_EMAIL', name: 'RESEND_FROM_EMAIL', required: false },
